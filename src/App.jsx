@@ -2,10 +2,10 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { supabase } from './lib/supabaseClient';
 import { QRCodeCanvas } from 'qrcode.react';
 import {
-  Clock, QrCode, Users, Download, Camera, CheckCircle, AlertCircle,
+  Clock, QrCode, Users, Download, CheckCircle, AlertCircle,
   Plus, Save, Trash2, ScanLine, Lock, Unlock, BarChart3, Coffee,
   Briefcase, Utensils, Moon, User, Settings, FileSpreadsheet, LogOut,
-  ShieldCheck, Play, Square, Calendar, Edit3, Eye, EyeOff
+  ShieldCheck, Play, Square, Edit3, Eye, EyeOff
 } from 'lucide-react';
 
 const BREAK_REASONS = [
@@ -34,8 +34,7 @@ export default function App() {
   const [reportLogs, setReportLogs] = useState([]);
   const [reportBreaks, setReportBreaks] = useState([]);
 
-  // Kiosk & QR Scanner State
-  const [cameraActive, setCameraActive] = useState(false);
+  // Desktop Scanner & Kiosk State
   const [qrInput, setQrInput] = useState('');
   const [activeEmployeeModal, setActiveEmployeeModal] = useState(null); // { employee, attendance, openBreak }
   const [selectedBreakReason, setSelectedBreakReason] = useState('Shop Work');
@@ -67,12 +66,19 @@ export default function App() {
   // Admin: Manual Override Modal
   const [overrideModal, setOverrideModal] = useState(null);
 
-  const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const scanTimerRef = useRef(null);
-  const cooldownRef = useRef(false);
+  const scannerInputRef = useRef(null);
 
   const todayStr = useMemo(() => new Date().toISOString().split('T')[0], []);
+
+  // Keep desktop scanner input ready when on Kiosk tab and no modal is open
+  useEffect(() => {
+    if (activeTab === 'kiosk' && !activeEmployeeModal && !pendingTab && !overrideModal && !selectedQrEmp) {
+      const timer = setTimeout(() => {
+        scannerInputRef.current?.focus();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [activeTab, activeEmployeeModal, pendingTab, overrideModal, selectedQrEmp, statusBanner]);
 
   // Live Clock Ticker
   useEffect(() => {
@@ -166,7 +172,6 @@ export default function App() {
       setActiveTab('kiosk');
       return;
     }
-    stopCamera();
     if (isAdminUnlocked) {
       setActiveTab(tabId);
     } else {
@@ -222,86 +227,20 @@ export default function App() {
     }
   };
 
-  // Camera Scanner Controls
-  const stopCamera = () => {
-    if (scanTimerRef.current) {
-      clearInterval(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
-    }
-    setCameraActive(false);
-  };
-
-  useEffect(() => {
-    return () => stopCamera();
-  }, []);
-
-  const startCameraScanner = async () => {
-    if (cameraActive) {
-      stopCamera();
-      return;
-    }
-
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      showMessage('error', 'Camera API unavailable on this browser. Use QR token input or select employee below.');
-      return;
-    }
-
-    if (!('BarcodeDetector' in window)) {
-      showMessage('info', 'Direct camera QR detection is unavailable in this browser. Use a USB QR scanner or select employee below.');
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }
-      });
-      streamRef.current = stream;
-      setCameraActive(true);
-
-      setTimeout(async () => {
-        if (!videoRef.current) return;
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-
-        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
-
-        scanTimerRef.current = setInterval(async () => {
-          if (!videoRef.current || videoRef.current.readyState !== 4 || cooldownRef.current) return;
-          try {
-            const barcodes = await detector.detect(videoRef.current);
-            if (barcodes && barcodes.length > 0) {
-              const rawValue = (barcodes[0].rawValue || '').trim();
-              if (rawValue) {
-                cooldownRef.current = true;
-                openEmployeeActionMenu(rawValue);
-                setTimeout(() => {
-                  cooldownRef.current = false;
-                }, 2500);
-              }
-            }
-          } catch {
-            // Ignore frame read glitches
-          }
-        }, 350);
-      }, 100);
-    } catch (err) {
-      stopCamera();
-      showMessage('error', 'Could not start camera: ' + err.message);
-    }
-  };
-
-  // Open Smart Action Modal upon QR Scan or Employee Click
+  // Open Smart Action Modal upon Desktop QR Scanner Read or Employee Tap
   const openEmployeeActionMenu = async (identifier) => {
     const clean = (identifier || '').trim();
+    if (!clean) {
+      showMessage('error', 'Please scan an employee QR badge.');
+      return;
+    }
+
     const emp = employees.find(
       (e) => e.qr_code === clean || String(e.id) === clean
     );
     if (!emp) {
-      showMessage('error', 'Employee badge not recognized.');
+      setQrInput('');
+      showMessage('error', 'Employee QR badge not recognized.');
       return;
     }
 
@@ -323,6 +262,7 @@ export default function App() {
       openBreak = brk || null;
     }
 
+    setQrInput('');
     setSelectedBreakReason('Shop Work');
     setActiveEmployeeModal({
       employee: emp,
@@ -393,7 +333,6 @@ export default function App() {
 
       if (actionType === 'CLOCK_OUT') {
         if (!attendance) throw new Error('Employee is not clocked in.');
-        // Auto-close any active break if employee clocks out directly
         if (openBreak) {
           await supabase
             .from('attendance_breaks')
@@ -409,7 +348,6 @@ export default function App() {
       }
 
       setActiveEmployeeModal(null);
-      setQrInput('');
       await fetchTodayData();
     } catch (err) {
       showMessage('error', err.message);
@@ -452,10 +390,8 @@ export default function App() {
     const grossMs = Math.max(0, end - start);
 
     const { shopWorkMs, personalBreakMs } = getBreakBreakdownMs(log.id, breaksSource);
-    // Net duty time deducts personal/lunch/prayer breaks, while keeping Shop Work break counted as duty
     const netDutyMs = Math.max(0, grossMs - personalBreakMs);
 
-    // Scheduled shift length
     const sStart = (log.employees?.shift_start || '09:00:00').split(':').map(Number);
     const sEnd = (log.employees?.shift_end || '18:00:00').split(':').map(Number);
     const scheduledMins = (sEnd[0] * 60 + sEnd[1]) - (sStart[0] * 60 + sStart[1]);
@@ -629,14 +565,14 @@ export default function App() {
             </div>
             <div>
               <div style={{ fontWeight: '700', fontSize: '1.15rem', letterSpacing: '-0.01em' }}>ROYAL STORE</div>
-              <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Workforce & Attendance Suite</div>
+              <div style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Desktop QR Attendance & Shift Suite</div>
             </div>
           </div>
 
           {/* Navigation Pills */}
           <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
             {[
-              { id: 'kiosk', label: 'QR Kiosk', icon: QrCode, locked: false },
+              { id: 'kiosk', label: 'Desktop QR Kiosk', icon: QrCode, locked: false },
               { id: 'dashboard', label: 'Live Overview', icon: BarChart3, locked: true },
               { id: 'staff', label: 'Staff & Shifts', icon: Users, locked: true },
               { id: 'reports', label: 'Reports & Audit', icon: FileSpreadsheet, locked: true },
@@ -701,11 +637,11 @@ export default function App() {
         )}
 
         {/* =========================================================
-            TAB 1: PUBLIC QR KIOSK TERMINAL (NO PIN REQUIRED)
+            TAB 1: DESKTOP QR SCANNER KIOSK (NO PIN REQUIRED)
            ========================================================= */}
         {activeTab === 'kiosk' && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: '1.5rem' }}>
-            {/* Left Column: Live Clock & QR Scanner */}
+            {/* Left Column: Live Clock & Desktop Scanner Ready Box */}
             <div style={{ backgroundColor: '#ffffff', borderRadius: '1rem', padding: '1.5rem', boxShadow: '0 4px 12px rgba(15,23,42,0.06)', border: '1px solid #e2e8f0' }}>
               <div style={{ textAlign: 'center', paddingBottom: '1.25rem', borderBottom: '1px solid #f1f5f9', marginBottom: '1.25rem' }}>
                 <div style={{ fontSize: '2.25rem', fontWeight: '800', color: '#0f172a', fontVariantNumeric: 'tabular-nums' }}>
@@ -716,63 +652,61 @@ export default function App() {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                <h2 style={{ fontSize: '1.05rem', fontWeight: '700', margin: 0 }}>Scan Employee QR Badge</h2>
-                <button
-                  onClick={startCameraScanner}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: '0.45rem', padding: '0.55rem 1rem', borderRadius: '0.5rem',
-                    border: 'none', fontWeight: '600', cursor: 'pointer', fontSize: '0.85rem',
-                    backgroundColor: cameraActive ? '#475569' : '#2563eb', color: '#ffffff'
+              <div style={{ backgroundColor: '#eff6ff', border: '2px dashed #2563eb', borderRadius: '0.85rem', padding: '1.15rem', marginBottom: '1.25rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#1d4ed8', fontWeight: '700', fontSize: '1rem', marginBottom: '0.4rem' }}>
+                  <ScanLine size={20} />
+                  <span>Desktop QR Scanner Ready</span>
+                </div>
+                <p style={{ fontSize: '0.83rem', color: '#334155', margin: '0 0 0.85rem 0' }}>
+                  Scan an employee QR badge using the scanner attached to this computer. The input stays focused automatically.
+                </p>
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    openEmployeeActionMenu(qrInput);
                   }}
+                  style={{ display: 'flex', gap: '0.5rem' }}
                 >
-                  <Camera size={17} /> {cameraActive ? 'Stop Camera' : 'Open Camera'}
-                </button>
+                  <input
+                    ref={scannerInputRef}
+                    type="text"
+                    autoFocus
+                    placeholder="Scan QR badge here..."
+                    value={qrInput}
+                    onChange={(e) => setQrInput(e.target.value)}
+                    style={{
+                      flex: 1, padding: '0.7rem 0.9rem', borderRadius: '0.5rem',
+                      border: '2px solid #2563eb', backgroundColor: '#ffffff', fontSize: '0.95rem', fontWeight: '500'
+                    }}
+                  />
+                  <button
+                    type="submit"
+                    style={{
+                      padding: '0.7rem 1rem', backgroundColor: '#2563eb', color: '#fff',
+                      border: 'none', borderRadius: '0.5rem', fontWeight: '700', cursor: 'pointer'
+                    }}
+                  >
+                    Enter
+                  </button>
+                </form>
               </div>
 
-              {cameraActive && (
-                <div style={{ marginBottom: '1.25rem', textAlign: 'center' }}>
-                  <video
-                    ref={videoRef}
-                    playsInline
-                    muted
-                    style={{ width: '100%', maxHeight: '280px', objectFit: 'cover', borderRadius: '0.75rem', border: '3px solid #2563eb', backgroundColor: '#000' }}
-                  />
-                  <p style={{ fontSize: '0.8rem', color: '#64748b', marginTop: '0.4rem' }}>
-                    Hold badge steady in front of camera to Clock In, Start/End Break, or Clock Out.
-                  </p>
-                </div>
-              )}
-
-              {/* Barcode / Token Input */}
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  openEmployeeActionMenu(qrInput);
-                }}
-                style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.25rem' }}
-              >
-                <input
-                  type="text"
-                  placeholder="Scan QR token with barcode gun or type code..."
-                  value={qrInput}
-                  onChange={(e) => setQrInput(e.target.value)}
-                  style={{ flex: 1, padding: '0.65rem 0.85rem', borderRadius: '0.5rem', border: '1px solid #cbd5e1', fontSize: '0.9rem' }}
-                />
-                <button
-                  type="submit"
-                  style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', padding: '0.65rem 1rem', backgroundColor: '#0f172a', color: '#fff', border: 'none', borderRadius: '0.5rem', fontWeight: '600', cursor: 'pointer' }}
-                >
-                  <ScanLine size={17} /> Verify
-                </button>
-              </form>
-
-              {/* Quick Tap Staff Cards (Fallback when camera is unavailable) */}
+              {/* Quick Tap Staff Cards (Manual Backup on Desktop) */}
               <div>
-                <div style={{ fontSize: '0.8rem', fontWeight: '600', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: '0.6rem' }}>
-                  Or Tap Employee Card to Punch / Break
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.6rem' }}>
+                  <span style={{ fontSize: '0.8rem', fontWeight: '600', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    Or Click Staff Card Directly
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => scannerInputRef.current?.focus()}
+                    style={{ background: 'none', border: 'none', color: '#2563eb', fontSize: '0.78rem', fontWeight: '600', cursor: 'pointer' }}
+                  >
+                    Refocus Scanner
+                  </button>
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(145px, 1fr))', gap: '0.6rem', maxHeight: '260px', overflowY: 'auto' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(145px, 1fr))', gap: '0.6rem', maxHeight: '250px', overflowY: 'auto' }}>
                   {employees.map((emp) => {
                     const log = todayLogs.find((l) => l.employee_id === emp.id);
                     const activeBrk = log ? todayBreaks.find((b) => b.attendance_id === log.id && !b.break_end) : null;
@@ -797,10 +731,11 @@ export default function App() {
                     return (
                       <button
                         key={emp.id}
+                        type="button"
                         onClick={() => openEmployeeActionMenu(emp.id)}
                         style={{
                           textAlign: 'left', padding: '0.7rem', borderRadius: '0.6rem', border: '1px solid #e2e8f0',
-                          backgroundColor: '#ffffff', cursor: 'pointer', transition: 'border-color 0.15s'
+                          backgroundColor: '#ffffff', cursor: 'pointer'
                         }}
                       >
                         <div style={{ fontWeight: '700', fontSize: '0.9rem', color: '#0f172a', marginBottom: '0.15rem' }}>{emp.name}</div>
@@ -902,7 +837,6 @@ export default function App() {
            ========================================================= */}
         {activeTab === 'dashboard' && isAdminUnlocked && (
           <div>
-            {/* 4 KPI Summary Cards */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '1rem', marginBottom: '1.5rem' }}>
               <div style={{ backgroundColor: '#fff', padding: '1.25rem', borderRadius: '0.85rem', border: '1px solid #e2e8f0' }}>
                 <div style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: '600' }}>TOTAL ACTIVE STAFF</div>
@@ -924,7 +858,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Detailed Today Duty & Break Breakdown + Manual Override */}
             <div style={{ backgroundColor: '#fff', padding: '1.5rem', borderRadius: '1rem', border: '1px solid #e2e8f0' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1rem' }}>
                 <h2 style={{ fontSize: '1.15rem', fontWeight: '700', margin: 0 }}>Today's Duty & Break Audit ({todayStr})</h2>
@@ -1246,7 +1179,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Case A: Not Clocked In Yet */}
             {!activeEmployeeModal.attendance && (
               <div>
                 <p style={{ fontSize: '0.9rem', color: '#334155', marginBottom: '1rem' }}>
@@ -1262,7 +1194,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Case B: Clocked In & Currently ON BREAK */}
             {activeEmployeeModal.attendance && !activeEmployeeModal.attendance.clock_out && activeEmployeeModal.openBreak && (
               <div>
                 <div style={{ padding: '0.85rem', backgroundColor: '#fef3c7', borderRadius: '0.6rem', color: '#92400e', fontSize: '0.9rem', marginBottom: '1rem' }}>
@@ -1288,7 +1219,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Case C: Clocked In & Actively Working (Choose Break Reason or Clock Out) */}
             {activeEmployeeModal.attendance && !activeEmployeeModal.attendance.clock_out && !activeEmployeeModal.openBreak && (
               <div>
                 <div style={{ fontSize: '0.85rem', fontWeight: '700', color: '#334155', marginBottom: '0.55rem' }}>
@@ -1337,7 +1267,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Case D: Already Clocked Out for Today */}
             {activeEmployeeModal.attendance && activeEmployeeModal.attendance.clock_out && (
               <div style={{ padding: '0.9rem', backgroundColor: '#f1f5f9', borderRadius: '0.6rem', color: '#334155', fontSize: '0.9rem' }}>
                 Shift completed for today. Clocked out at{' '}
